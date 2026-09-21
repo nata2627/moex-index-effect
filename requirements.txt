@@ -1,0 +1,12 @@
+# Фиксация версий: воспроизводимость важнее свежести.
+pandas==2.2.3
+numpy==1.26.4
+statsmodels==0.14.4
+scipy==1.14.1
+matplotlib==3.9.2
+seaborn==0.13.2
+pyarrow==17.0.0
+requests==2.32.3
+tqdm==4.66.5
+jupyter==1.1.1
+pytest==8.3.3
