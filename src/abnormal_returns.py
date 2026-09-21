@@ -147,3 +147,52 @@ def car_by_event(abnormal: pd.DataFrame, window: tuple[int, int]) -> pd.DataFram
     # Нужна, чтобы волатильные бумаги не перевешивали спокойные при усреднении.
     result["scar"] = result["car"] / (result["sigma_ar"] * np.sqrt(result["n_days"]))
     return result
+
+
+def matched_returns(matches: pd.DataFrame,
+                    quotes: pd.DataFrame,
+                    calendar: pd.DatetimeIndex,
+                    window: tuple[int, int]) -> pd.DataFrame:
+    """Накопленная разность доходностей тестовой и контрольной бумаги.
+
+    Прямая оценка эффекта «разность разностей» по цене: вместо вычитания
+    рыночной компоненты по оценённой бете вычитается фактическая доходность
+    сопоставимой бумаги. Бета здесь не нужна вовсе, поэтому оценка не зависит
+    от качества окна оценки — но зависит от качества подбора контроля.
+
+    Две оценки полезны именно вместе: если они расходятся, значит результат
+    держится на одном из этих двух допущений, и это надо знать.
+    """
+    quoted = quotes.loc[quotes["CLOSE"].notna()]
+    by_ticker = {ticker: pd.Series(frame["CLOSE"].to_numpy(dtype=float),
+                                   index=pd.DatetimeIndex(frame["TRADEDATE"]))
+                 for ticker, frame in quoted.groupby("SECID")}
+
+    rows = []
+    for pair in matches.itertuples():
+        offsets = events_module.relative_day_index(calendar, pair.event_date)
+        window_dates = offsets[offsets.between(*window)].index
+
+        def cumulative(ticker: str) -> float:
+            series = by_ticker.get(ticker)
+            if series is None:
+                return np.nan
+            values = series.reindex(window_dates).ffill().dropna()
+            if len(values) < 2:
+                return np.nan
+            return float(np.log(values.iloc[-1] / values.iloc[0]))
+
+        treated_return = cumulative(pair.ticker)
+        control_return = cumulative(pair.control)
+        rows.append({
+            "event_id": pair.event_id,
+            "ticker": pair.ticker,
+            "event_type": pair.event_type,
+            "event_date": pair.event_date,
+            "control": pair.control,
+            "treated_return": treated_return,
+            "control_return": control_return,
+            "difference": treated_return - control_return,
+        })
+
+    return pd.DataFrame(rows)

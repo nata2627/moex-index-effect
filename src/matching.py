@@ -36,11 +36,53 @@ from src import events as events_module
 # Окно измерения признаков матчинга, торговых дней до события.
 FEATURE_WINDOW = (-60, -11)
 
+# Окно измерения предсобытийной динамики. Берётся глубже окна признаков:
+# правила индекса смотрят на капитализацию и ликвидность за длительный
+# период, и бумага попадает в индекс по итогам примерно года роста.
+MOMENTUM_WINDOW = (-250, -31)
+
 # Насколько далеко от даты события у кандидата не должно быть своих событий,
 # торговых дней. Слева шире: нужно чистое окно оценки.
 CONTAMINATION_WINDOW = (-250, 60)
 
 MIN_FEATURE_DAYS = 20
+
+
+def compute_momentum(tickers: list[str],
+                     quotes: pd.DataFrame,
+                     index_prices: pd.DataFrame,
+                     calendar: pd.DatetimeIndex,
+                     event_date: pd.Timestamp,
+                     window: tuple[int, int] = MOMENTUM_WINDOW) -> pd.Series:
+    """Избыточная доходность бумаги к рынку за период до события.
+
+    Нужна как признак матчинга. В индекс МосБиржи попадают бумаги, которые к
+    моменту пересмотра выросли: у включаемых избыточная доходность за год до
+    события составляет в среднем плюс 18 процентов, у исключаемых — минус 42.
+    Если не уравнять группы по этому признаку, разность тест-контроль будет
+    измерять возврат к среднему после роста, а вовсе не эффект индекса.
+    """
+    offsets = events_module.relative_day_index(calendar, event_date)
+    window_dates = offsets[offsets.between(*window)].index
+    if len(window_dates) < 2:
+        return pd.Series(dtype=float)
+
+    index_prices = index_prices.sort_values("TRADEDATE")
+    market = index_prices[index_prices["TRADEDATE"].isin(window_dates)]["CLOSE"]
+    market_return = (np.log(market.iloc[-1] / market.iloc[0])
+                     if len(market) >= 2 else 0.0)
+
+    frame = quotes[quotes["SECID"].isin(tickers) &
+                   quotes["TRADEDATE"].isin(window_dates) &
+                   quotes["CLOSE"].notna()]
+
+    values = {}
+    for ticker, part in frame.groupby("SECID"):
+        part = part.sort_values("TRADEDATE")
+        if len(part) < 100:
+            continue
+        values[ticker] = np.log(part["CLOSE"].iloc[-1] / part["CLOSE"].iloc[0]) - market_return
+    return pd.Series(values, name="momentum")
 
 
 def compute_features(tickers: list[str],
@@ -115,6 +157,19 @@ def eligible_controls(candidate_pool: list[str],
             if t not in in_index_now and t not in nearby]
 
 
+# Максимальное расстояние, при котором соответствие считается приемлемым.
+# Измеряется в стандартных отклонениях признаков по всему пулу кандидатов:
+# значение 1.0 означает, что бумаги отличаются примерно на 0.7 стандартного
+# отклонения по каждому из двух признаков.
+CALIPER = 1.0
+
+MATCH_LEVELS = {
+    1: "та же отрасль, близкое соответствие",
+    2: "другая отрасль, близкое соответствие",
+    3: "ближайший из доступных, соответствие далёкое",
+}
+
+
 def match_controls(events: pd.DataFrame,
                    quotes: pd.DataFrame,
                    securities: pd.DataFrame,
@@ -125,25 +180,30 @@ def match_controls(events: pd.DataFrame,
                    candidate_pool: list[str],
                    n_neighbours: int = 1,
                    strict: bool = False,
+                   caliper: float = CALIPER,
+                   match_on_momentum: bool = False,
+                   index_prices: pd.DataFrame | None = None,
                    feature_window: tuple[int, int] = FEATURE_WINDOW) -> pd.DataFrame:
     """Для каждого события подобрать ``n_neighbours`` контрольных бумаг.
 
-    Возвращает таблицу пар событие-контроль с расстоянием и значениями
-    признаков обеих бумаг — баланс ковариат проверяется по ней напрямую.
+    Матчинг каскадный. Сначала ищется бумага той же отрасли в пределах
+    calliper; если такой нет — та же процедура по всему рынку; если и там
+    никого — берётся просто ближайшая, и пара помечается как далёкая.
+    Каскад нужен по двум причинам: часть бумаг вообще не входит в отраслевые
+    индексы (Сегежа, например), а в строительстве кандидатов всего двое, и
+    настаивать на отрасли там значит получить заведомо непохожий контроль.
+
+    Признаки стандартизуются по разбросу всего пула кандидатов на эту дату,
+    а не внутри отрасли. Иначе масштаб расстояния зависел бы от размера
+    отраслевой группы: в отрасли из двух бумаг разброс мал, и любое различие
+    превращается в огромное расстояние.
     """
     sector_map = sectors.groupby("ticker")["sector_name"].apply(set).to_dict()
 
     pairs = []
     for event in events.itertuples():
-        own_sectors = sector_map.get(event.ticker, set())
-        if not own_sectors:
-            continue
-
         pool = eligible_controls(candidate_pool, composition, all_events,
                                  calendar, event.event_date, strict=strict)
-        # Точное совпадение по отрасли: у бумаги и контроля должен быть общий
-        # отраслевой индекс.
-        pool = [t for t in pool if sector_map.get(t, set()) & own_sectors]
         if not pool:
             continue
 
@@ -153,23 +213,49 @@ def match_controls(events: pd.DataFrame,
         if event.ticker not in set(features["SECID"]):
             continue
 
+        feature_columns = ["log_cap", "log_trades"]
+        if match_on_momentum:
+            if index_prices is None:
+                raise ValueError("для матчинга по динамике нужны котировки индекса")
+            momentum = compute_momentum(pool + [event.ticker], quotes, index_prices,
+                                        calendar, event.event_date)
+            features = features.assign(momentum=features["SECID"].map(momentum))
+            features = features.dropna(subset=["momentum"])
+            feature_columns.append("momentum")
+
+        if event.ticker not in set(features["SECID"]):
+            continue
+
         target = features[features["SECID"] == event.ticker].iloc[0]
-        controls = features[features["SECID"] != event.ticker]
+        controls = features[features["SECID"] != event.ticker].copy()
         if controls.empty:
             continue
 
-        # Стандартизация по пулу кандидатов этого события: расстояние должно
-        # измеряться в единицах разброса того множества, из которого выбираем.
+        # Масштаб — по всему пулу кандидатов этой даты.
         distances = np.zeros(len(controls))
-        for column in ("log_cap", "log_trades"):
+        for column in feature_columns:
             spread = controls[column].std()
             if not np.isfinite(spread) or spread == 0:
                 spread = 1.0
             distances += ((controls[column] - target[column]) / spread) ** 2
-        controls = controls.assign(distance=np.sqrt(distances))
+        controls["distance"] = np.sqrt(distances)
+
+        own_sectors = sector_map.get(event.ticker, set())
+        same_sector = controls[controls["SECID"].apply(
+            lambda t: bool(sector_map.get(t, set()) & own_sectors))]
+
+        near_sector = same_sector[same_sector["distance"] <= caliper]
+        near_any = controls[controls["distance"] <= caliper]
+
+        if len(near_sector) >= n_neighbours:
+            chosen, level = near_sector, 1
+        elif len(near_any) >= n_neighbours:
+            chosen, level = near_any, 2
+        else:
+            chosen, level = controls, 3
 
         for rank, row in enumerate(
-                controls.nsmallest(n_neighbours, "distance").itertuples(), start=1):
+                chosen.nsmallest(n_neighbours, "distance").itertuples(), start=1):
             pairs.append({
                 "event_id": event.event_id,
                 "ticker": event.ticker,
@@ -178,10 +264,15 @@ def match_controls(events: pd.DataFrame,
                 "control": row.SECID,
                 "rank": rank,
                 "distance": row.distance,
+                "match_level": level,
+                "match_quality": MATCH_LEVELS[level],
+                "same_sector": bool(sector_map.get(row.SECID, set()) & own_sectors),
                 "target_log_cap": target["log_cap"],
                 "control_log_cap": row.log_cap,
                 "target_log_trades": target["log_trades"],
                 "control_log_trades": row.log_trades,
+                "target_momentum": target.get("momentum", np.nan),
+                "control_momentum": getattr(row, "momentum", np.nan),
                 "n_pool": len(controls),
             })
 
@@ -197,9 +288,14 @@ def covariate_balance(matches: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for label, target_column, control_column in (
             ("логарифм капитализации", "target_log_cap", "control_log_cap"),
-            ("логарифм числа сделок", "target_log_trades", "control_log_trades")):
-        target = matches[target_column]
-        control = matches[control_column]
+            ("логарифм числа сделок", "target_log_trades", "control_log_trades"),
+            ("доходность до события", "target_momentum", "control_momentum")):
+        if target_column not in matches.columns:
+            continue
+        target = matches[target_column].dropna()
+        control = matches[control_column].dropna()
+        if target.empty or control.empty:
+            continue
         pooled = np.sqrt((target.var() + control.var()) / 2)
         rows.append({
             "признак": label,
