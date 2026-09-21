@@ -162,6 +162,11 @@ def main() -> None:
     print(estimates[["event_type", "metric_name", "coefficient", "se",
                      "p_value", "p_holm"]].round(4).to_string(index=False))
 
+    print("\nВсплеск оборота в дни ребалансировки")
+    spike = did.rebalancing_spike(panel)
+    spike.to_parquet(moex.DATA_PROCESSED / "rebalancing_spike.parquet", index=False)
+    print(spike.round(4).to_string(index=False))
+
     print("\nПроверка параллельных трендов")
     print(trends[["event_type", "metric_name", "f_stat", "p_value"]].round(4).to_string(index=False))
 

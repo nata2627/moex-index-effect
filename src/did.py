@@ -208,3 +208,47 @@ def event_time_means(panel: pd.DataFrame, metric: str) -> pd.DataFrame:
     """
     grouped = panel.groupby(["t", "treated"])[metric].agg(["mean", "std", "count"])
     return grouped.reset_index()
+
+
+# Окно самой ребалансировки и база сравнения для оценки всплеска.
+SPIKE_WINDOW = (-1, 1)
+SPIKE_BASELINE = (-60, -31)
+
+
+def rebalancing_spike(panel: pd.DataFrame, metric: str = "log_value",
+                      spike_window: tuple[int, int] = SPIKE_WINDOW,
+                      baseline: tuple[int, int] = SPIKE_BASELINE) -> pd.DataFrame:
+    """Насколько подскакивает оборот в дни самой ребалансировки.
+
+    Основная оценка разности разностей намеренно исключает окрестность
+    события: она отвечает на вопрос, изменилась ли ликвидность надолго. Но
+    сама сделка индексных фондов — наблюдаемое событие, и её стоит измерить
+    отдельно, иначе механизм остаётся непроверенным утверждением.
+
+    Сравнение идёт в разности разностей: подскок тестовой бумаги относительно
+    её же обычного уровня минус то же самое для контрольной. Так из оценки
+    уходит общий для рынка всплеск активности в дни пересмотра индекса.
+    """
+    rows = []
+    for event_type, part in panel.groupby("event_type"):
+        levels = {}
+        for treated in (0, 1):
+            group = part[part["treated"] == treated]
+            base = group[group["t"].between(*baseline)][metric].mean()
+            spike = group[group["t"].between(*spike_window)][metric].mean()
+            levels[treated] = {"base": base, "spike": spike,
+                               "change": spike - base}
+
+        difference = levels[1]["change"] - levels[0]["change"]
+        rows.append({
+            "event_type": event_type,
+            "metric": metric,
+            "metric_name": METRICS.get(metric, metric),
+            # Значения в разах: логарифмы удобны для оценки, но читать
+            # результат проще в процентах изменения.
+            "treated_change": np.expm1(levels[1]["change"]),
+            "control_change": np.expm1(levels[0]["change"]),
+            "difference_log": difference,
+            "difference": np.expm1(difference),
+        })
+    return pd.DataFrame(rows)
