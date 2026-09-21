@@ -35,15 +35,19 @@ def event_tickers() -> list[str]:
 
 
 def control_tickers() -> list[str]:
-    """Пул кандидатов: все бумаги TQBR, кроме участвовавших в событиях.
+    """Пул кандидатов в контрольную группу.
 
-    Бумаги, входившие в индекс когда-либо, из пула не исключаются здесь —
-    отбор по «никогда не был в индексе» делается на этапе матчинга, где
-    видна дата конкретного события.
+    Берём пересечение режима TQBR и отраслевых индексов МосБиржи: отраслевая
+    принадлежность нужна для матчинга, а бумаги вне отраслевых индексов —
+    это в основном неликвид, сопоставлять с которым включаемую в IMOEX бумагу
+    бессмысленно. Из пула сразу убираем участников событий; фильтр «не входила
+    в IMOEX на дату события» применяется позже, на этапе матчинга, где известна
+    конкретная дата.
     """
     securities = pd.read_parquet(moex.DATA_RAW / "tqbr_securities.parquet")
-    excluded = set(event_tickers())
-    return sorted(set(securities["SECID"]) - excluded)
+    sectors = pd.read_parquet(moex.DATA_RAW / "sector_composition.parquet")
+    candidates = set(securities["SECID"]) & set(sectors["ticker"])
+    return sorted(candidates - set(event_tickers()))
 
 
 def fetch_many(tickers: list[str]) -> pd.DataFrame:
